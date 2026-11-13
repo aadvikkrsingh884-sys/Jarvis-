@@ -1,37 +1,95 @@
-name: Build Jarvis APK
+name: Build Jarvis Debug APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
-  build:
+  build-apk:
+    name: Extract ZIP & Build Debug APK
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Set up JDK 21 (Required for AGP 9.1.1 / Gradle 9.3.1)
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '21'
-          distribution: 'temurin'
 
-      - name: Setup Gradle 9.3.1
+      - name: Locate and extract Android project ZIP (if present)
+        run: |
+          set -euo pipefail
+          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" ! -path "./.git/*" | head -n 1 || true)
+
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found project archive: $ZIP_FILE"
+            rm -rf build_workspace
+            mkdir -p build_workspace
+            unzip -q "$ZIP_FILE" -d build_workspace
+          else
+            echo "No ZIP archive found; building directly from repository files."
+            mkdir -p build_workspace
+            rsync -a --exclude='.git' --exclude='.github' --exclude='build_workspace' ./ build_workspace/
+          fi
+
+          SETTINGS_PATH=$(find build_workspace -maxdepth 4 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1 || true)
+          if [ -z "$SETTINGS_PATH" ]; then
+            echo "::error::Could not locate settings.gradle or settings.gradle.kts inside the project!"
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_PATH")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Detected Android project root: $PROJECT_DIR"
+
+      - name: Prepare optional environment config (.env)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+            cp .env.example .env
+            echo "Copied .env.example to .env"
+          elif [ ! -f ".env" ]; then
+            touch .env
+            echo "Created empty .env fallback (no .env.example found)"
+          else
+            echo "Existing .env detected"
+          fi
+
+      - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Create .env from example
-        run: cp .env.example .env
+      - name: Run Unit Tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle testDebugUnitTest --no-daemon --stacktrace
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Upload Jarvis APK
+      - name: Verify Generated Debug APK
+        id: verify_apk
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1 || true)
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "::error::Debug APK was not generated in app/build/outputs/apk/debug!"
+            exit 1
+          fi
+          echo "Verified APK: $APK_PATH ($(du -h "$APK_PATH" | cut -f1))"
+          echo "apk_path=${{ env.PROJECT_DIR }}/$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Jarvis-APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Jarvis-APK
+          path: ${{ steps.verify_apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 14
           
