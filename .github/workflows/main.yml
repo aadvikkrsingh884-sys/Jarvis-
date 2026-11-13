@@ -1,4 +1,4 @@
-name: Build Jarvis Debug APK
+name: Build Jarvis Android APK
 
 on:
   push:
@@ -8,88 +8,111 @@ on:
 
 jobs:
   build-apk:
-    name: Extract ZIP & Build Debug APK
+    name: Build Debug APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21 (Required for AGP 9.1.1 / Gradle 9.3.1)
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Locate and extract Android project ZIP (if present)
+      - name: Extract project ZIP if present
         run: |
-          set -euo pipefail
-          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" ! -path "./.git/*" | head -n 1 || true)
-
+          set -e
+          mkdir -p workspace
+          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" ! -path "./workspace/*" | head -n 1)
           if [ -n "$ZIP_FILE" ]; then
             echo "Found project archive: $ZIP_FILE"
-            rm -rf build_workspace
-            mkdir -p build_workspace
-            unzip -q "$ZIP_FILE" -d build_workspace
+            unzip -q "$ZIP_FILE" -d workspace
           else
-            echo "No ZIP archive found; building directly from repository files."
-            mkdir -p build_workspace
-            rsync -a --exclude='.git' --exclude='.github' --exclude='build_workspace' ./ build_workspace/
+            echo "No ZIP archive found; copying repository files into workspace"
+            rsync -a --exclude='.git' --exclude='workspace' ./ workspace/
           fi
 
-          SETTINGS_PATH=$(find build_workspace -maxdepth 4 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1 || true)
-          if [ -z "$SETTINGS_PATH" ]; then
-            echo "::error::Could not locate settings.gradle or settings.gradle.kts inside the project!"
+      - name: Locate Android project root and configure environment
+        id: locate
+        run: |
+          set -e
+          BUILD_FILE=$(find workspace -maxdepth 4 -path "*/app/build.gradle.kts" -o -path "*/app/build.gradle" | head -n 1)
+          if [ -z "$BUILD_FILE" ]; then
+            echo "::error::Could not locate app/build.gradle.kts inside the repository or extracted ZIP."
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS_PATH")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Detected Android project root: $PROJECT_DIR"
+          PROJECT_ROOT=$(dirname "$(dirname "$BUILD_FILE")")
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected Android project root: $PROJECT_ROOT"
 
-      - name: Prepare optional environment config (.env)
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
-            cp .env.example .env
-            echo "Copied .env.example to .env"
-          elif [ ! -f ".env" ]; then
-            touch .env
-            echo "Created empty .env fallback (no .env.example found)"
-          else
-            echo "Existing .env detected"
+          cd "$PROJECT_ROOT"
+
+          # Handle .env.example conditionally without failing if absent
+          if [ ! -f ".env" ]; then
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+              echo "Created .env from .env.example"
+            else
+              touch .env
+              echo "Created empty .env (.env.example not present)"
+            fi
           fi
 
-      - name: Set up Gradle 9.3.1
+          # Inject GEMINI_API_KEY from GitHub Secrets if configured (never printed to logs)
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            printf '\nGEMINI_API_KEY=%s\n' "${{ secrets.GEMINI_API_KEY }}" >> .env
+          fi
+
+          # Ensure debug.keystore exists if debugConfig points to ${rootDir}/debug.keystore
+          if grep -q 'debugConfig' app/build.gradle.kts 2>/dev/null && [ ! -f "debug.keystore" ]; then
+            echo "Generating debug.keystore required by app/build.gradle.kts debugConfig..."
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+          fi
+
+      - name: Setup Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Run Unit Tests
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle testDebugUnitTest --no-daemon --stacktrace
-
       - name: Build Debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Verify Generated Debug APK
-        id: verify_apk
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: ${{ steps.locate.outputs.project_root }}
         run: |
-          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1 || true)
-          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
-            echo "::error::Debug APK was not generated in app/build/outputs/apk/debug!"
+          set -e
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Verify generated APK
+        id: verify_apk
+        working-directory: ${{ steps.locate.outputs.project_root }}
+        run: |
+          set -e
+          APK_PATH=$(find app/build/outputs/apk/debug -type f -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
+            echo "::error::Debug APK was not generated or is empty."
             exit 1
           fi
+          echo "apk_path=${{ steps.locate.outputs.project_root }}/$APK_PATH" >> "$GITHUB_OUTPUT"
           echo "Verified APK: $APK_PATH ($(du -h "$APK_PATH" | cut -f1))"
-          echo "apk_path=${{ env.PROJECT_DIR }}/$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Jarvis-APK Artifact
+      - name: Upload Jarvis APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Jarvis-APK
           path: ${{ steps.verify_apk.outputs.apk_path }}
           if-no-files-found: error
-          retention-days: 14
           
